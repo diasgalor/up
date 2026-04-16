@@ -55,6 +55,10 @@ PLATFORM_WIDTH_TO_METERS_FACTOR = {
     "assume_feet": 0.3048,
 }
 
+# Modo temporario solicitado: manter apenas a jornada de sobreposicao ativa.
+OVERLAP_MOBILE_ONLY_MODE = True
+
+
 def infer_background_mask(arr: np.ndarray) -> np.ndarray:
     finite = arr[np.isfinite(arr)]
     if finite.size == 0:
@@ -2357,7 +2361,7 @@ for candidate in [TELEMETRY_PROCESS_FILE, DEFAULT_OPERATION_FILE]:
     except Exception as exc:
         st.warning(f"Falha ao montar dataset profissional ({candidate.name}): {exc}")
 
-if OVERLAP_MOBILE_ONLY_MODE:
+if globals().get("OVERLAP_MOBILE_ONLY_MODE", True):
     render_overlap_mobile_only(professional_ops_global, professional_source)
     st.stop()
 
