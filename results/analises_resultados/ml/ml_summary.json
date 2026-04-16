@@ -1,0 +1,16 @@
+{
+  "rows_base": 265191,
+  "periodo_inicio": "2026-02-02 08:21:28",
+  "periodo_fim": "2026-03-31 23:23:13",
+  "q75_consumo_prod": 46.31,
+  "top_stop_causes": [
+    "FIM DE EXPEDIENTE",
+    "CLIMA  -SECO-UMIDO-CHUVA VENTO-ORVALHO",
+    "FALTA CAMINHAO",
+    "CONSTRUCAO DE GALPAO",
+    "AGUARD ORDENS",
+    "REGULAGEM PARA OPERACAO",
+    "MANUTENCAO BASICA",
+    "REFEICAO"
+  ]
+}

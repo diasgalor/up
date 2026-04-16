@@ -1,0 +1,2 @@
+target;rows_train;rows_test;positive_rate_test;roc_auc;f1;precision;recall;q75_consumo;q75_rpm;q25_velocidade
+target_ineficiencia_balanceada;80000;20000;0.43055;0.9643683868039702;0.8832283596232094;0.8491961414790997;0.9201021948670305;46.31;2352.0;3.85
