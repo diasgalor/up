@@ -55,10 +55,6 @@ PLATFORM_WIDTH_TO_METERS_FACTOR = {
     "assume_feet": 0.3048,
 }
 
-# Modo temporario solicitado: manter apenas a jornada de sobreposicao ativa.
-OVERLAP_MOBILE_ONLY_MODE = True
-
-
 def infer_background_mask(arr: np.ndarray) -> np.ndarray:
     finite = arr[np.isfinite(arr)]
     if finite.size == 0:
