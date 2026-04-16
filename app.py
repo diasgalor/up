@@ -41,6 +41,16 @@ GEE_DECISION_PREFIXES = {
     "fazenda_climate_daily": "DECISION_fazenda_climate_daily_",
 }
 
+# Premissa de unidade da largura de plataforma na camada de alocacao teorica:
+# - vl_largura_implemento e tratada como METROS por padrao.
+# - Se houver confirmacao de outra unidade (ex.: pes), ajustar o fator abaixo
+#   ou expor seletor de unidade no app em etapa futura.
+PLATFORM_WIDTH_UNIT_ASSUMPTION = "assume_meters"
+PLATFORM_WIDTH_TO_METERS_FACTOR = {
+    "assume_meters": 1.0,
+    "assume_feet": 0.3048,
+}
+
 
 def infer_background_mask(arr: np.ndarray) -> np.ndarray:
     finite = arr[np.isfinite(arr)]
@@ -1009,7 +1019,9 @@ def load_professional_ops_dataset(
     out["bearing_deg"] = np.nan
     out["dist_m"] = np.nan
     out["speed_m_s_impl"] = np.nan
-    out["direcao_setor"] = np.nan
+    # Mantem coluna categórica textual para evitar conflito de dtype
+    # (ex.: tentativa de atribuir strings em coluna float64).
+    out["direcao_setor"] = pd.Series(pd.NA, index=out.index, dtype="string")
     out["dir_valida"] = False
     if has_seg:
         lat1 = out["vl_latitude_inicial"]
@@ -1043,7 +1055,7 @@ def load_professional_ops_dataset(
 
             labels = np.array(["N", "NE", "E", "SE", "S", "SW", "W", "NW"], dtype=object)
             sectors = ((out["bearing_deg"] + 22.5) // 45) % 8
-            out.loc[seg_ok, "direcao_setor"] = sectors[seg_ok].map({i: labels[i] for i in range(8)})
+            out.loc[seg_ok, "direcao_setor"] = sectors[seg_ok].map({i: labels[i] for i in range(8)}).astype("string")
             out["dir_valida"] = seg_ok & out["dist_m"].ge(5) & out["speed_m_s_impl"].le(20)
 
     return out.reset_index(drop=True)
@@ -1257,6 +1269,234 @@ def build_overlap_polygon(gdf_utm: gpd.GeoDataFrame) -> Polygon | MultiPolygon |
     if not inters:
         return None
     return unary_union(inters)
+
+
+def get_platform_width_factor(width_unit_mode: str = PLATFORM_WIDTH_UNIT_ASSUMPTION) -> float:
+    """Retorna fator de conversao da unidade operacional para metros."""
+    return PLATFORM_WIDTH_TO_METERS_FACTOR.get(width_unit_mode, 1.0)
+
+
+@st.cache_data(show_spinner=False)
+def estimate_talhao_area_ha(talhao_label: str, fields_path: Path) -> float:
+    """
+    Estima area total do talhao em hectares.
+
+    Prioridade:
+    1) coluna AREA_TOTAL (quando existente e valida);
+    2) area geometrica reprojetada para UTM local (ha).
+    """
+    if not talhao_label or not fields_path.exists():
+        return np.nan
+
+    try:
+        fields = load_fields_map(fields_path)
+    except Exception:
+        return np.nan
+    if fields is None or fields.empty:
+        return np.nan
+
+    label = str(talhao_label)
+    mask = pd.Series(False, index=fields.index)
+    if "DESC_TALHA" in fields.columns:
+        mask = mask | fields["DESC_TALHA"].astype(str).eq(label)
+    if "TALHAO" in fields.columns:
+        mask = mask | fields["TALHAO"].astype(str).eq(label)
+    subset = fields[mask].copy()
+    if subset.empty:
+        return np.nan
+
+    if "AREA_TOTAL" in subset.columns:
+        area_total = pd.to_numeric(subset["AREA_TOTAL"], errors="coerce").dropna()
+        area_total = area_total[area_total > 0]
+        if not area_total.empty:
+            return float(area_total.median())
+
+    try:
+        if subset.crs is None:
+            subset = subset.set_crs("EPSG:4326")
+        elif str(subset.crs) != "EPSG:4326":
+            subset = subset.to_crs("EPSG:4326")
+        union_geom = unary_union(list(subset.geometry))
+        if union_geom is None or union_geom.is_empty:
+            return np.nan
+        lon0, lat0 = float(union_geom.centroid.x), float(union_geom.centroid.y)
+        epsg = _utm_epsg_from_lonlat(lon0, lat0)
+        area_m2 = float(gpd.GeoSeries([union_geom], crs="EPSG:4326").to_crs(epsg=epsg).area.iloc[0])
+        if area_m2 <= 0:
+            return np.nan
+        return area_m2 / 10000.0
+    except Exception:
+        return np.nan
+
+
+@st.cache_data(show_spinner=False)
+def compute_theoretical_front_allocation(
+    df: pd.DataFrame,
+    area_total_talhao_ha: float,
+    width_unit_mode: str = PLATFORM_WIDTH_UNIT_ASSUMPTION,
+) -> pd.DataFrame:
+    """
+    Calcula alocacao teorica por maquina com peso proporcional a largura.
+
+    Formula aplicada:
+        area_teorica_maquina = area_total_talhao * (peso_maquina / soma_pesos_ativos)
+
+    Premissa atual de unidade:
+    - vl_largura_implemento e tratada como METROS (factor 1.0).
+    - Se a unidade real for pes, usar width_unit_mode='assume_feet'.
+    """
+    required = {"cd_equipamento", "vl_largura_implemento", "talhao_label", "data"}
+    if df is None or df.empty or not required.issubset(df.columns):
+        return pd.DataFrame()
+
+    out = df.copy()
+    out["cd_equipamento"] = out["cd_equipamento"].astype(str)
+    out["vl_largura_implemento"] = pd.to_numeric(out["vl_largura_implemento"], errors="coerce")
+    out = out[out["cd_equipamento"].notna()].copy()
+    if out.empty:
+        return pd.DataFrame()
+
+    width_factor = get_platform_width_factor(width_unit_mode)
+    by_machine = (
+        out.groupby("cd_equipamento", as_index=False)
+        .agg(
+            largura_plataforma=("vl_largura_implemento", "median"),
+            n_registros=("cd_equipamento", "size"),
+        )
+    )
+    by_machine["largura_plataforma"] = pd.to_numeric(by_machine["largura_plataforma"], errors="coerce")
+    by_machine["largura_plataforma_m"] = by_machine["largura_plataforma"] * width_factor
+    by_machine["largura_valida"] = by_machine["largura_plataforma_m"].between(0.5, 30.0)
+    by_machine["peso_maquina"] = np.where(by_machine["largura_valida"], by_machine["largura_plataforma_m"], np.nan)
+
+    sum_weights = float(by_machine["peso_maquina"].sum(skipna=True))
+    by_machine["participacao_teorica"] = np.where(
+        sum_weights > 0,
+        by_machine["peso_maquina"] / sum_weights,
+        np.nan,
+    )
+    by_machine["area_total_talhao_ha"] = float(area_total_talhao_ha) if pd.notna(area_total_talhao_ha) else np.nan
+    by_machine["area_teorica_ha"] = by_machine["area_total_talhao_ha"] * by_machine["participacao_teorica"]
+    by_machine["soma_larguras_ativas_m"] = sum_weights
+    by_machine["n_maquinas_ativas"] = int(by_machine["largura_valida"].sum())
+    by_machine["largura_unidade_assumida"] = (
+        "m" if width_unit_mode == "assume_meters" else "ft (convertido para m)"
+    )
+    by_machine["talhao_label"] = out["talhao_label"].astype(str).mode().iloc[0]
+    by_machine["data_ref"] = str(out["data"].min()) if out["data"].nunique() == 1 else f"{out['data'].min()}->{out['data'].max()}"
+    by_machine["maquina_sem_largura_valida"] = ~by_machine["largura_valida"]
+
+    return by_machine
+
+
+@st.cache_data(show_spinner=False)
+def compute_real_front_allocation(
+    df: pd.DataFrame,
+    max_points_per_machine: int = 1800,
+) -> pd.DataFrame:
+    """
+    Consolida area real por maquina reutilizando camada de sobreposicao existente.
+
+    Limitacao metodologica:
+    - area_real_ha representa a area unica por maquina (auto-sobreposicao interna da maquina removida).
+    - nao remove, nesta etapa, intersecoes entre maquinas diferentes para alocacao individual.
+    """
+    required = {
+        "data",
+        "cd_equipamento",
+        "dt_hr_local_inicial",
+        "latitude_interpolacao",
+        "longitude_interpolacao",
+        "vl_largura_implemento",
+    }
+    if df is None or df.empty or not required.issubset(df.columns):
+        return pd.DataFrame()
+
+    overlap = estimate_overlap_by_machine_day(df, max_points_per_group=int(max_points_per_machine))
+    if overlap is None:
+        overlap = pd.DataFrame()
+    if not overlap.empty:
+        overlap = (
+            overlap.groupby("cd_equipamento", as_index=False)
+            .agg(
+                area_real_bruta_ha=("area_teorica_ha", "sum"),
+                area_real_ha=("area_unica_ha", "sum"),
+                area_sobreposta_ha=("area_sobreposicao_ha", "sum"),
+            )
+        )
+
+    coverage_ll, _ = build_machine_coverage_polygons(df, max_points_per_machine=int(max_points_per_machine))
+    coverage = pd.DataFrame()
+    if coverage_ll is not None and not coverage_ll.empty:
+        coverage = (
+            coverage_ll.groupby("cd_equipamento", as_index=False)
+            .agg(area_real_unica_poligono_ha=("area_ha", "sum"))
+        )
+
+    if overlap.empty and coverage.empty:
+        return pd.DataFrame()
+
+    if overlap.empty:
+        out = coverage.copy()
+        out["area_real_bruta_ha"] = np.nan
+        out["area_real_ha"] = out["area_real_unica_poligono_ha"]
+        out["area_sobreposta_ha"] = np.nan
+    elif coverage.empty:
+        out = overlap.copy()
+        out["area_real_unica_poligono_ha"] = np.nan
+    else:
+        out = overlap.merge(coverage, on="cd_equipamento", how="outer")
+        out["area_real_ha"] = out["area_real_ha"].fillna(out["area_real_unica_poligono_ha"])
+
+    out["cd_equipamento"] = out["cd_equipamento"].astype(str)
+    return out
+
+
+@st.cache_data(show_spinner=False)
+def build_front_allocation_comparison(
+    df: pd.DataFrame,
+    area_total_talhao_ha: float,
+    width_unit_mode: str = PLATFORM_WIDTH_UNIT_ASSUMPTION,
+    max_points_per_machine: int = 1800,
+) -> pd.DataFrame:
+    """Monta tabela comparativa final de alocacao teorica vs real por maquina."""
+    theo = compute_theoretical_front_allocation(
+        df=df,
+        area_total_talhao_ha=area_total_talhao_ha,
+        width_unit_mode=width_unit_mode,
+    )
+    real = compute_real_front_allocation(df=df, max_points_per_machine=max_points_per_machine)
+    if theo.empty and real.empty:
+        return pd.DataFrame()
+
+    if theo.empty:
+        base = real.copy()
+        base["talhao_label"] = df["talhao_label"].astype(str).mode().iloc[0] if "talhao_label" in df.columns else "n/d"
+        base["data_ref"] = str(df["data"].min()) if "data" in df.columns else "n/d"
+        base["largura_plataforma"] = np.nan
+        base["participacao_teorica"] = np.nan
+        base["area_teorica_ha"] = np.nan
+        base["soma_larguras_ativas_m"] = np.nan
+        base["n_maquinas_ativas"] = np.nan
+        base["maquina_sem_largura_valida"] = True
+        base["largura_unidade_assumida"] = "n/d"
+    else:
+        base = theo.merge(real, on="cd_equipamento", how="left")
+
+    if "area_real_ha" not in base.columns:
+        base["area_real_ha"] = np.nan
+    base["desvio_alocacao_ha"] = base["area_real_ha"] - base["area_teorica_ha"]
+    base["indice_aderencia"] = np.where(
+        base["area_teorica_ha"].fillna(0) > 0,
+        base["area_real_ha"] / base["area_teorica_ha"],
+        np.nan,
+    )
+    base["desvio_percentual"] = np.where(
+        base["area_teorica_ha"].fillna(0) > 0,
+        (base["desvio_alocacao_ha"] / base["area_teorica_ha"]) * 100.0,
+        np.nan,
+    )
+    return base
 
 
 def add_polygon_to_mapbox(
@@ -3790,6 +4030,77 @@ with tab9:
                 st.caption(
                     "Modelo geométrico: GPS como eixo central da máquina; plataforma simulada por polígonos de cada passada com `largura_implemento/2` para cada lado."
                 )
+
+                st.markdown("#### Alocacao teorica vs real da frente de colheita (primeira camada)")
+                area_total_talhao_ha = estimate_talhao_area_ha(str(overlap_talhao), FIELDS_FILE)
+                if pd.isna(area_total_talhao_ha) and pd.notna(unique_global_ha):
+                    # Fallback operacional: usa area unica observada no dia/talhao.
+                    area_total_talhao_ha = float(unique_global_ha)
+
+                alloc_df = build_front_allocation_comparison(
+                    ov_df,
+                    area_total_talhao_ha=float(area_total_talhao_ha) if pd.notna(area_total_talhao_ha) else np.nan,
+                    width_unit_mode=PLATFORM_WIDTH_UNIT_ASSUMPTION,
+                    max_points_per_machine=int(overlap_points),
+                )
+                if alloc_df is None or alloc_df.empty:
+                    st.info("Sem dados suficientes para calcular alocacao teorica vs real neste recorte.")
+                else:
+                    soma_larguras_ativas = float(alloc_df["soma_larguras_ativas_m"].dropna().iloc[0]) if alloc_df["soma_larguras_ativas_m"].notna().any() else np.nan
+                    n_maquinas_ativas = int(alloc_df["n_maquinas_ativas"].dropna().iloc[0]) if alloc_df["n_maquinas_ativas"].notna().any() else 0
+                    maior_desvio_pos = alloc_df["desvio_alocacao_ha"].max() if "desvio_alocacao_ha" in alloc_df.columns else np.nan
+                    maior_desvio_neg = alloc_df["desvio_alocacao_ha"].min() if "desvio_alocacao_ha" in alloc_df.columns else np.nan
+                    aderencia_media = alloc_df["indice_aderencia"].mean() if "indice_aderencia" in alloc_df.columns else np.nan
+
+                    a1, a2, a3, a4, a5, a6 = st.columns(6)
+                    with a1:
+                        kpi_card("Area total talhao", f"{area_total_talhao_ha:.2f} ha" if pd.notna(area_total_talhao_ha) else "n/d", "base teorica")
+                    with a2:
+                        kpi_card("Soma larguras ativas", f"{soma_larguras_ativas:.2f} m" if pd.notna(soma_larguras_ativas) else "n/d", "premissa de unidade")
+                    with a3:
+                        kpi_card("Maquinas ativas", f"{n_maquinas_ativas}", "com largura valida")
+                    with a4:
+                        kpi_card("Maior desvio +", f"{maior_desvio_pos:.2f} ha" if pd.notna(maior_desvio_pos) else "n/d", "real - teorico")
+                    with a5:
+                        kpi_card("Maior desvio -", f"{maior_desvio_neg:.2f} ha" if pd.notna(maior_desvio_neg) else "n/d", "real - teorico")
+                    with a6:
+                        kpi_card("Aderencia media", f"{aderencia_media:.2f}" if pd.notna(aderencia_media) else "n/d", "area_real / area_teorica")
+
+                    display_cols = [
+                        "cd_equipamento",
+                        "talhao_label",
+                        "data_ref",
+                        "largura_plataforma",
+                        "participacao_teorica",
+                        "area_teorica_ha",
+                        "area_real_ha",
+                        "desvio_alocacao_ha",
+                        "indice_aderencia",
+                        "desvio_percentual",
+                        "area_sobreposta_ha",
+                        "maquina_sem_largura_valida",
+                    ]
+                    show_cols = [c for c in display_cols if c in alloc_df.columns]
+                    alloc_view = alloc_df[show_cols].copy()
+                    if "participacao_teorica" in alloc_view.columns:
+                        alloc_view["participacao_teorica"] = (alloc_view["participacao_teorica"] * 100.0).round(2)
+                    if "desvio_percentual" in alloc_view.columns:
+                        alloc_view["desvio_percentual"] = alloc_view["desvio_percentual"].round(2)
+
+                    st.dataframe(
+                        alloc_view.sort_values("desvio_alocacao_ha", ascending=False, na_position="last"),
+                        use_container_width=True,
+                        height=300,
+                    )
+                    st.caption(
+                        "Premissa desta etapa: `vl_largura_implemento` esta sendo tratado como METROS; "
+                        "se a origem estiver em pes, ajuste o fator de conversao na constante "
+                        "`PLATFORM_WIDTH_TO_METERS_FACTOR`."
+                    )
+                    st.caption(
+                        "Limitacao metodologica: area real por maquina remove sobreposicao interna da propria maquina, "
+                        "mas nao separa integralmente intersecoes entre maquinas diferentes."
+                    )
 
             # Analise de "faixinhas / meia plataforma" (proxy por eficiência de largura).
             eff_df = prof[
