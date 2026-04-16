@@ -13,7 +13,11 @@ from shapely.geometry import LineString, MultiPolygon, Polygon
 from shapely.ops import unary_union
 import streamlit as st
 
-st.set_page_config(page_title="Analise MDT - Agricultura de Precisao", layout="wide")
+st.set_page_config(
+    page_title="Analise MDT - Agricultura de Precisao",
+    layout="centered",
+    initial_sidebar_state="collapsed",
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
@@ -50,7 +54,6 @@ PLATFORM_WIDTH_TO_METERS_FACTOR = {
     "assume_meters": 1.0,
     "assume_feet": 0.3048,
 }
-
 
 def infer_background_mask(arr: np.ndarray) -> np.ndarray:
     finite = arr[np.isfinite(arr)]
@@ -1499,6 +1502,273 @@ def build_front_allocation_comparison(
     return base
 
 
+def inject_mobile_overlap_css():
+    st.markdown(
+        """
+<style>
+.main .block-container {max-width: 760px; padding-top: 0.7rem; padding-bottom: 2.0rem;}
+.ov-hero {background: linear-gradient(135deg,#0f172a,#1e293b); color:#f8fafc; border-radius:14px; padding:14px 16px; margin-bottom:10px;}
+.ov-hero h2 {font-size:1.2rem; margin:0 0 4px 0;}
+.ov-hero p {font-size:0.92rem; margin:0; opacity:0.92;}
+.ov-section {padding:10px 0 4px 0; border-top:1px solid rgba(148,163,184,0.25); margin-top:10px;}
+.ov-title {font-size:1.02rem; font-weight:700; margin:0 0 6px 0;}
+.ov-kpi-grid {display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; margin-top:6px;}
+.ov-kpi {border:1px solid rgba(148,163,184,0.22); border-radius:12px; padding:10px; background:#0b1220;}
+.ov-kpi .k {font-size:.75rem;color:#93c5fd;margin-bottom:4px;}
+.ov-kpi .v {font-size:1rem;color:#f8fafc;font-weight:700;}
+.ov-kpi .s {font-size:.72rem;color:#94a3b8;}
+@media (max-width: 640px){
+  .main .block-container {padding-left: 0.8rem; padding-right: 0.8rem;}
+  .ov-hero h2 {font-size:1.05rem;}
+  .ov-kpi .v {font-size:.95rem;}
+}
+</style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_overlap_mobile_only(
+    prof: pd.DataFrame,
+    source_path: Path | None,
+):
+    inject_mobile_overlap_css()
+    st.markdown(
+        """
+<div class="ov-hero">
+  <h2>Sobreposição Operacional — Mobile</h2>
+  <p>Visão focada em talhão/dia com análise teórica vs real por máquina.</p>
+</div>
+        """,
+        unsafe_allow_html=True,
+    )
+    if source_path is not None:
+        st.caption(f"Fonte ativa: `{source_path}`")
+
+    if prof is None or prof.empty:
+        st.warning("Sem dados profissionais para montar a análise de sobreposição.")
+        return
+
+    st.markdown('<div class="ov-section"><div class="ov-title">Filtros</div></div>', unsafe_allow_html=True)
+    p = prof.copy()
+    date_options = sorted(p["data"].dropna().unique().tolist())
+    selected_day = st.selectbox("Dia", date_options, index=max(len(date_options) - 1, 0))
+
+    p_day = p[p["data"] == selected_day].copy()
+    talhoes = sorted(
+        p_day.loc[p_day["talhao_label"].notna() & p_day["talhao_label"].ne("SEM_TALHAO"), "talhao_label"]
+        .astype(str)
+        .unique()
+        .tolist()
+    )
+    selected_talhao = st.selectbox("Talhão", talhoes if talhoes else ["Sem dados"])
+
+    state_options = sorted(p_day["estado_processo"].dropna().astype(str).unique().tolist())
+    default_states = [s for s in ["Efetivo"] if s in state_options] or state_options[:1]
+    selected_states = st.multiselect("Estado operacional", options=state_options, default=default_states)
+
+    machine_options = sorted(p_day["cd_equipamento"].dropna().astype(str).unique().tolist())
+    selected_machines = st.multiselect("Máquinas", options=machine_options, default=machine_options)
+
+    max_pts = st.slider("Densidade geométrica (pts/máquina)", 600, 2600, 1400, step=200)
+    show_swaths = st.toggle("Mostrar faixas detalhadas no mapa", value=False)
+
+    ov_df = p_day.copy()
+    if talhoes:
+        ov_df = ov_df[ov_df["talhao_label"].astype(str) == str(selected_talhao)].copy()
+    if selected_states:
+        ov_df = ov_df[ov_df["estado_processo"].astype(str).isin(selected_states)].copy()
+    if selected_machines:
+        ov_df = ov_df[ov_df["cd_equipamento"].astype(str).isin([str(m) for m in selected_machines])].copy()
+    ov_df = ov_df[ov_df["vl_largura_implemento"].notna()].copy()
+
+    if ov_df.empty:
+        st.info("Sem dados para os filtros selecionados.")
+        return
+
+    overlap_res = estimate_overlap_by_machine_day(ov_df, max_points_per_group=int(max_pts))
+    coverage_ll, coverage_utm = build_machine_coverage_polygons(ov_df, max_points_per_machine=int(max_pts))
+    swath_ll, _ = build_swath_segment_polygons(ov_df, max_segments_per_machine=int(max(500, max_pts)))
+
+    overlap_geom_ll = None
+    overlap_global_ha = np.nan
+    overlap_global_pct = np.nan
+    theoretical_global_ha = np.nan
+    unique_global_ha = np.nan
+    if coverage_utm is not None and not coverage_utm.empty:
+        union_geom = unary_union(list(coverage_utm.geometry))
+        theoretical_global_ha = float(coverage_utm["theoretical_ha"].sum())
+        unique_global_ha = float(union_geom.area / 10000.0) if union_geom is not None and not union_geom.is_empty else 0.0
+        overlap_global_ha = max(theoretical_global_ha - unique_global_ha, 0.0)
+        overlap_global_pct = (overlap_global_ha / theoretical_global_ha) * 100.0 if theoretical_global_ha > 0 else np.nan
+        ov_geom = build_overlap_polygon(coverage_utm)
+        if ov_geom is not None and not ov_geom.is_empty:
+            overlap_geom_ll = gpd.GeoSeries([ov_geom], crs=coverage_utm.crs).to_crs("EPSG:4326").iloc[0]
+
+    area_total_talhao_ha = estimate_talhao_area_ha(str(selected_talhao), FIELDS_FILE)
+    if pd.isna(area_total_talhao_ha) and pd.notna(unique_global_ha):
+        area_total_talhao_ha = float(unique_global_ha)
+
+    alloc_df = build_front_allocation_comparison(
+        ov_df,
+        area_total_talhao_ha=float(area_total_talhao_ha) if pd.notna(area_total_talhao_ha) else np.nan,
+        width_unit_mode=PLATFORM_WIDTH_UNIT_ASSUMPTION,
+        max_points_per_machine=int(max_pts),
+    )
+
+    st.markdown('<div class="ov-section"><div class="ov-title">KPIs principais</div></div>', unsafe_allow_html=True)
+    n_machines = int(ov_df["cd_equipamento"].astype(str).nunique())
+    aderencia_media = alloc_df["indice_aderencia"].mean() if (alloc_df is not None and not alloc_df.empty and "indice_aderencia" in alloc_df.columns) else np.nan
+    maior_desvio = alloc_df["desvio_alocacao_ha"].abs().max() if (alloc_df is not None and not alloc_df.empty and "desvio_alocacao_ha" in alloc_df.columns) else np.nan
+    st.markdown(
+        f"""
+<div class="ov-kpi-grid">
+  <div class="ov-kpi"><div class="k">Área total do talhão</div><div class="v">{area_total_talhao_ha:.2f} ha</div><div class="s">base teórica</div></div>
+  <div class="ov-kpi"><div class="k">Sobreposição atual</div><div class="v">{overlap_global_pct:.2f}%</div><div class="s">{overlap_global_ha:.2f} ha</div></div>
+  <div class="ov-kpi"><div class="k">Máquinas ativas</div><div class="v">{n_machines}</div><div class="s">filtro atual</div></div>
+  <div class="ov-kpi"><div class="k">Aderência média</div><div class="v">{aderencia_media:.2f}</div><div class="s">real / teórico</div></div>
+  <div class="ov-kpi"><div class="k">Maior desvio</div><div class="v">{maior_desvio:.2f} ha</div><div class="s">módulo por máquina</div></div>
+</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown('<div class="ov-section"><div class="ov-title">Mapa principal</div></div>', unsafe_allow_html=True)
+    fig_cov = go.Figure()
+    talhao_geom = None
+    try:
+        all_fields = load_fields_map(FIELDS_FILE)
+        if str(all_fields.crs) != "EPSG:4326":
+            all_fields = all_fields.to_crs("EPSG:4326")
+        talhao_match = all_fields[all_fields["DESC_TALHA"].astype(str) == str(selected_talhao)].copy() if "DESC_TALHA" in all_fields.columns else pd.DataFrame()
+        if not talhao_match.empty:
+            talhao_geom = unary_union(list(talhao_match.geometry))
+    except Exception:
+        talhao_geom = None
+
+    if talhao_geom is not None and not talhao_geom.is_empty:
+        add_polygon_to_mapbox(
+            fig_cov,
+            talhao_geom,
+            name="Talhão",
+            line_color="rgba(27,38,59,0.95)",
+            fill_color="rgba(0,0,0,0)",
+            line_width=2.2,
+            showlegend=True,
+        )
+    if show_swaths and swath_ll is not None and not swath_ll.empty:
+        for eq, grp_eq in swath_ll.groupby("cd_equipamento", sort=False):
+            grp_eq = grp_eq.iloc[: min(len(grp_eq), 500), :]
+            first = True
+            for geom in grp_eq.geometry:
+                add_polygon_to_mapbox(
+                    fig_cov,
+                    geom,
+                    name=f"Faixa {eq}",
+                    line_color="rgba(30,136,229,0.80)",
+                    fill_color="rgba(30,136,229,0.24)",
+                    line_width=1.2,
+                    showlegend=first,
+                )
+                first = False
+    if overlap_geom_ll is not None:
+        add_polygon_to_mapbox(
+            fig_cov,
+            overlap_geom_ll,
+            name="Sobreposição",
+            line_color="rgba(220,20,60,0.98)",
+            fill_color="rgba(220,20,60,0.50)",
+            line_width=2.2,
+            showlegend=True,
+        )
+
+    center_lat = float(ov_df["latitude_interpolacao"].median())
+    center_lon = float(ov_df["longitude_interpolacao"].median())
+    fig_cov.update_layout(
+        mapbox=dict(style="carto-positron", center=dict(lat=center_lat, lon=center_lon), zoom=15.3),
+        template="plotly_white",
+        height=760,
+        margin=dict(l=8, r=8, t=10, b=8),
+        legend=dict(orientation="h", y=1.02, x=0, font=dict(size=11)),
+    )
+    st.plotly_chart(fig_cov, use_container_width=True, config={"scrollZoom": True, "displayModeBar": True})
+
+    st.markdown('<div class="ov-section"><div class="ov-title">Comparativo por máquina</div></div>', unsafe_allow_html=True)
+    if alloc_df is None or alloc_df.empty:
+        st.info("Sem dados suficientes para comparativo por máquina.")
+    else:
+        comp = alloc_df.copy()
+        comp["desvio_abs_ha"] = comp["desvio_alocacao_ha"].abs()
+        comp = comp.sort_values("desvio_abs_ha", ascending=False)
+
+        chart_df = comp[["cd_equipamento", "desvio_alocacao_ha"]].dropna()
+        if not chart_df.empty:
+            fig_bar = px.bar(
+                chart_df.head(8),
+                x="cd_equipamento",
+                y="desvio_alocacao_ha",
+                color="desvio_alocacao_ha",
+                color_continuous_scale="RdBu_r",
+                title="Desvio (ha): real - teórico",
+            )
+            fig_bar.update_layout(
+                height=380,
+                margin=dict(l=8, r=8, t=36, b=8),
+                template="plotly_white",
+                coloraxis_showscale=False,
+                xaxis_title="Máquina",
+                yaxis_title="Desvio (ha)",
+            )
+            st.plotly_chart(fig_bar, use_container_width=True)
+
+        table_view = comp[
+            [
+                "cd_equipamento",
+                "largura_plataforma",
+                "participacao_teorica",
+                "area_teorica_ha",
+                "area_real_ha",
+                "desvio_alocacao_ha",
+                "indice_aderencia",
+                "area_sobreposta_ha",
+            ]
+        ].copy()
+        table_view = table_view.rename(
+            columns={
+                "cd_equipamento": "Máquina",
+                "largura_plataforma": "Largura",
+                "participacao_teorica": "% Teórico",
+                "area_teorica_ha": "Teórico (ha)",
+                "area_real_ha": "Real (ha)",
+                "desvio_alocacao_ha": "Desvio (ha)",
+                "indice_aderencia": "Aderência",
+                "area_sobreposta_ha": "Sobrep. (ha)",
+            }
+        )
+        table_view["% Teórico"] = (table_view["% Teórico"] * 100.0).round(1)
+        st.dataframe(table_view, use_container_width=True, height=280)
+
+    st.markdown('<div class="ov-section"><div class="ov-title">Resumo interpretativo</div></div>', unsafe_allow_html=True)
+    if alloc_df is None or alloc_df.empty:
+        st.write("- Sem dados suficientes para interpretação neste recorte.")
+    else:
+        rank = alloc_df.copy().dropna(subset=["desvio_alocacao_ha"])
+        if rank.empty:
+            st.write("- Sem desvio calculável para o recorte selecionado.")
+        else:
+            top_pos = rank.sort_values("desvio_alocacao_ha", ascending=False).iloc[0]
+            top_neg = rank.sort_values("desvio_alocacao_ha", ascending=True).iloc[0]
+            st.markdown(
+                f"""
+- **Leitura geral:** sobreposição estimada em **{overlap_global_pct:.2f}%** (**{overlap_global_ha:.2f} ha**).
+- **Maior excesso vs teórico:** máquina **{top_pos['cd_equipamento']}** ({top_pos['desvio_alocacao_ha']:.2f} ha).
+- **Maior déficit vs teórico:** máquina **{top_neg['cd_equipamento']}** ({top_neg['desvio_alocacao_ha']:.2f} ha).
+- **Premissa de unidade:** `vl_largura_implemento` tratada como metros nesta etapa.
+                """
+            )
+    st.info("Modo temporário ativo: apenas análise de sobreposição está habilitada. Demais módulos foram isolados para reativação futura.")
+
+
 def add_polygon_to_mapbox(
     fig: go.Figure,
     geom,
@@ -2086,6 +2356,10 @@ for candidate in [TELEMETRY_PROCESS_FILE, DEFAULT_OPERATION_FILE]:
             break
     except Exception as exc:
         st.warning(f"Falha ao montar dataset profissional ({candidate.name}): {exc}")
+
+if OVERLAP_MOBILE_ONLY_MODE:
+    render_overlap_mobile_only(professional_ops_global, professional_source)
+    st.stop()
 
 ndvi_for_talhoes = None
 if ndvi_layer is not None and ndvi_layer["arr"].shape == rasters["Declividade"]["arr"].shape:
